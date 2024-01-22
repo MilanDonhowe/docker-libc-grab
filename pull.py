@@ -1,49 +1,57 @@
 from requests import *
 import tarfile
 import os
-from sys import argv
+import click
+import io
 
-# command line handling
-if len(argv) > 1:
-    image = argv[1]
+@click.command()
+@click.option('-d', '--digest', help="image digest in the format of <image>@<digest>")
+def grabLibc(digest):
+    """Automatically extracts the libc.so.6 file from a given container image hash."""
+    if digest == None:
+        print("[*] No docker image digest provided...")
+        return
+    name, digest = digest.split('@')
 
-#image='ubuntu@sha256:bbf3d1baa208b7649d1d0264ef7d522e1dc0deeeaaf6085bf8e4618867f03494'
-name, digest = image.split('@')
-
-
-def getAuth(image):
-    """Grabs auth token for docker registry"""
-    response = get("https://auth.docker.io/token", params={
+    print("[*] Acquiring auth token from docker.io...")
+    # Grab Auth token
+    auth = get("https://auth.docker.io/token", params={
         "service":"registry.docker.io",
-        "scope":f"repository:library/{image}:pull"
-    })
-    if (response.status_code == 200):
-        return response.json()
-    raise ConnectionRefusedError("Could not get Authenticated")
+        "scope":f"repository:library/{name}:pull"
+    }).json()
+    token = auth['token']
 
-auth = getAuth(name)
-token = auth['token']
+    print("[*] Downloading manifest for docker image...")
+    # Grab manifest
+    manifest = get(f"https://registry-1.docker.io/v2/library/{name}/manifests/{digest}" ,headers={
+        'Authorization': f'Bearer {token}',
+        'Accept':'application/vnd.oci.image.manifest.v1+json'
+    }).json()
 
-# Grab manifest
-manifest = get(f"https://registry-1.docker.io/v2/library/{name}/manifests/{digest}" ,headers={
-    'Authorization': f'Bearer {token}',
-    'Accept':'application/vnd.oci.image.manifest.v1+json'
-}).json()
+    print(f"[*] Found manifest with {len(manifest['layers'])} layers")
+    # Download all layers, find libc.so.6
+    candidate_libcs = []
+    for i, layer in enumerate(manifest['layers']):
+        print(f"[*] Searching for libc file in layer {i+1}...")
+        blob = get(f"https://registry-1.docker.io/v2/library/{name}/blobs/{layer['digest']}" ,headers={
+            'Authorization': f'Bearer {token}'
+        }, stream=True)
+        # for now, just do a grep search for libc.so.6--it's probably the right libc
+        # I'll need to do more research on a smarter way to acquire the libc in the future
+        
+        # look for libc.so.6
+        with tarfile.open(fileobj=io.BytesIO(blob.content), mode='r:gz') as blob_tar:
+            search_results = list(filter(lambda x: 'libc.so.6' in x.name, blob_tar.getmembers()))
+            for result in search_results:
+                candidate_libcs.append(blob_tar.extractfile(result).read())
 
-# Grab Layer
-layer = get(f"https://registry-1.docker.io/v2/library/{name}/blobs/{manifest['layers'][0]['digest']}" ,headers={
-    'Authorization': f'Bearer {token}'
-}, stream=True)
+    print(f"[*] found {len(candidate_libcs)} possible libc files")
+    # just take the libc.so.6
+    if len(candidate_libcs) > 0:
+        with open('libc.so.6', "wb+") as libc:
+            libc.write(candidate_libcs[0])
+        print("[*] Saved libc as ./libc.so.6")
+if __name__ == '__main__':
+    grabLibc()
 
 
-# Download tar
-with open('layer.tar', 'wb') as f:
-    f.write(layer.content)
-# Grab libc
-with tarfile.open('layer.tar', "r:gz") as file:
-    libc_tarinfo = list(filter(lambda x: 'libc.so.6' in x.name, file.getmembers()))[0]
-    libc_data = file.extractfile(libc_tarinfo).read()
-with open("libc.so.6", "wb") as libc:
-    libc.write(libc_data)
-# Remove Layer
-os.remove('layer.tar')
